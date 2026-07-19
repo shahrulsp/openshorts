@@ -1,9 +1,8 @@
-// Auth + billing session state for cloud mode.
-// - Reads /api/config to learn whether billing is enabled at all.
-// - Handles the magic-link and Google OAuth redirect hashes.
-// - Exposes the current user, plan and minute balance to the app.
-// When billingEnabled is false the provider is inert and the app behaves as the
-// classic BYOK dashboard.
+// Auth/session state for both hosted cloud mode and the new independent SaaS mode.
+// - Reads /api/config to learn which auth model is active.
+// - Hosted cloud keeps magic-link / Google OAuth behavior.
+// - Independent SaaS uses direct email/password auth via /api/saas/*
+// - Self-host BYOK remains inert when no managed auth mode is enabled.
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { getApiUrl } from '../config';
 import { apiFetch, apiJson, getToken, setToken, clearToken } from '../lib/api';
@@ -12,15 +11,23 @@ const AuthContext = createContext(null);
 export const useAuth = () => useContext(AuthContext);
 
 export function AuthProvider({ children }) {
-  const [config, setConfig] = useState({ billingEnabled: false, googleAuthEnabled: false });
+  const [config, setConfig] = useState({
+    billingEnabled: false,
+    googleAuthEnabled: false,
+    saasEnabled: false,
+    geminiConfigured: false,
+    uploadPostConfigured: false,
+  });
   const [me, setMe] = useState(null);           // /api/me payload, or null when signed out
   const [loading, setLoading] = useState(true);
   const [signingIn, setSigningIn] = useState(false);
 
-  const refreshMe = useCallback(async () => {
+  const refreshMe = useCallback(async (configOverride = null) => {
+    const effectiveConfig = configOverride || config;
     if (!getToken()) { setMe(null); return null; }
     try {
-      const data = await apiJson('/api/me');
+      const sessionPath = effectiveConfig.saasEnabled ? '/api/saas/me' : '/api/me';
+      const data = await apiJson(sessionPath);
       setMe(data);
       return data;
     } catch (e) {
@@ -29,7 +36,7 @@ export function AuthProvider({ children }) {
       setMe(null);
       return null;
     }
-  }, []);
+  }, [config]);
 
   // Handle auth redirect hashes: #/auth/verify?ml=... and #/auth/callback?token=...
   const handleAuthHash = useCallback(async () => {
@@ -85,7 +92,9 @@ export function AuthProvider({ children }) {
         setConfig(cfg);
         if (cfg.billingEnabled) {
           const handled = await handleAuthHash();
-          if (!handled) await refreshMe();
+          if (!handled) await refreshMe(cfg);
+        } else if (cfg.saasEnabled) {
+          await refreshMe(cfg);
         }
       } catch (_) { /* config fetch failed — stay in BYOK */ }
       setLoading(false);
@@ -103,6 +112,35 @@ export function AuthProvider({ children }) {
     return true;
   }, []);
 
+  const loginWithPassword = useCallback(async ({ email, password }) => {
+    const data = await apiJson('/api/saas/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    if (data.access_token) setToken(data.access_token);
+    const session = { user: data.user, workspace: data.workspace };
+    setMe(session);
+    return session;
+  }, []);
+
+  const signupWithPassword = useCallback(async ({ workspaceName, fullName, email, password }) => {
+    const data = await apiJson('/api/saas/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        workspace_name: workspaceName,
+        full_name: fullName,
+        email,
+        password,
+      }),
+    });
+    if (data.access_token) setToken(data.access_token);
+    const session = { user: data.user, workspace: data.workspace };
+    setMe(session);
+    return session;
+  }, []);
+
   const loginWithGoogle = useCallback(() => {
     window.location.href = getApiUrl('/api/auth/google');
   }, []);
@@ -115,9 +153,13 @@ export function AuthProvider({ children }) {
   const value = {
     billingEnabled: config.billingEnabled,
     googleAuthEnabled: config.googleAuthEnabled,
+    saasEnabled: config.saasEnabled,
+    geminiConfigured: config.geminiConfigured,
+    uploadPostConfigured: config.uploadPostConfigured,
     loading,
     signingIn,
     user: me?.user || null,
+    workspace: me?.workspace || null,
     me,
     plan: me?.plan || null,
     entitled: !!me?.entitled,
@@ -127,6 +169,8 @@ export function AuthProvider({ children }) {
     isManaged: !!(config.billingEnabled && me?.entitled),
     refreshMe,
     requestMagicLink,
+    loginWithPassword,
+    signupWithPassword,
     loginWithGoogle,
     logout,
   };

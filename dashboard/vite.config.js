@@ -1,5 +1,10 @@
+import { existsSync } from 'node:fs'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+
+const isDocker = existsSync('/.dockerenv')
+const backendTarget = process.env.OPENSHORTS_BACKEND_URL || (isDocker ? 'http://backend:8000' : 'http://localhost:8000')
+const rendererTarget = process.env.OPENSHORTS_RENDERER_URL || (isDocker ? 'http://renderer:3100' : 'http://localhost:3100')
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -11,27 +16,27 @@ export default defineConfig({
     ],
     proxy: {
       '/api': {
-        target: 'http://backend:8000',
+        target: backendTarget,
         changeOrigin: true,
       },
       '/videos': {
-        target: 'http://backend:8000',
+        target: backendTarget,
         changeOrigin: true,
       },
       '/thumbnails': {
-        target: 'http://backend:8000',
+        target: backendTarget,
         changeOrigin: true,
       },
       '/gallery': {
-        target: 'http://backend:8000',
+        target: backendTarget,
         changeOrigin: true,
       },
       '/video': {
-        target: 'http://backend:8000',
+        target: backendTarget,
         changeOrigin: true,
       },
       '/render': {
-        target: 'http://renderer:3100',
+        target: rendererTarget,
         changeOrigin: true,
       }
     }

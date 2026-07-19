@@ -1,25 +1,35 @@
-"""Alembic environment (async) for cloud-mode migrations.
-
-Reads the DB URL from the DATABASE_URL env var and targets cloud.models metadata,
-so `alembic revision --autogenerate` works out of the box.
-"""
+"""Alembic environment (async) for cloud- or SaaS-mode migrations."""
 import asyncio
 import os
 from logging.config import fileConfig
 
+from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
-from alembic import context
 
-# Register model metadata.
-from cloud.database import Base
-import cloud.models  # noqa: F401
+from saas.config import load_saas_settings
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-db_url = os.environ.get("DATABASE_URL", "")
+settings = load_saas_settings()
+
+if settings.enabled:
+    from saas.database import Base
+
+    try:
+        import saas.models  # noqa: F401
+    except ModuleNotFoundError as exc:
+        if exc.name != "saas.models":
+            raise
+    db_url = settings.database_url or os.environ.get("DATABASE_URL", "")
+else:
+    from cloud.database import Base
+    import cloud.models  # noqa: F401
+
+    db_url = os.environ.get("DATABASE_URL", "")
+
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
 

@@ -18,7 +18,7 @@ const SectionHeader = ({ eyebrow, title, children }) => (
   <div className="mb-12">
     <p className="eyebrow mb-3">{eyebrow}</p>
     <h2 className="font-display text-3xl md:text-4xl lowercase text-ink tracking-tight mb-4">{title}</h2>
-    {children && <p className="text-muted max-w-2xl leading-relaxed">{children}</p>}
+    {children && <div className="text-muted max-w-2xl leading-relaxed">{children}</div>}
   </div>
 );
 

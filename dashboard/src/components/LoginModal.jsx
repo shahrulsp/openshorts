@@ -1,12 +1,26 @@
-import React, { useState } from 'react';
-import { Mail, Check, Loader2 } from 'lucide-react';
+import { useState } from 'react';
+import { Building2, Check, KeyRound, Loader2, Mail, User } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import Modal from './ui/Modal';
 
-// Sign-in modal: magic link (email) + Google OAuth.
+// Sign-in modal: hosted cloud uses magic-link / Google OAuth;
+// independent SaaS uses email/password sign-in and workspace sign-up.
 export default function LoginModal({ onClose }) {
-  const { requestMagicLink, loginWithGoogle, googleAuthEnabled } = useAuth();
+  const {
+    billingEnabled,
+    googleAuthEnabled,
+    saasEnabled,
+    requestMagicLink,
+    loginWithGoogle,
+    loginWithPassword,
+    signupWithPassword,
+  } = useAuth();
+  const isSaasAuth = saasEnabled && !billingEnabled;
+  const [mode, setMode] = useState('signin');
   const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [workspaceName, setWorkspaceName] = useState('');
   const [sent, setSent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -17,8 +31,26 @@ export default function LoginModal({ onClose }) {
     setBusy(true);
     setError('');
     try {
-      await requestMagicLink(email.trim());
-      setSent(true);
+      if (isSaasAuth) {
+        if (mode === 'signup') {
+          await signupWithPassword({
+            workspaceName: workspaceName.trim(),
+            fullName: fullName.trim(),
+            email: email.trim(),
+            password,
+          });
+        } else {
+          await loginWithPassword({
+            email: email.trim(),
+            password,
+          });
+        }
+        window.location.hash = '#app';
+        onClose?.();
+      } else {
+        await requestMagicLink(email.trim());
+        setSent(true);
+      }
     } catch (err) {
       setError(err.message || 'Something went wrong.');
     } finally {
@@ -28,7 +60,30 @@ export default function LoginModal({ onClose }) {
 
   return (
     <Modal isOpen onClose={onClose} eyebrow="ACCOUNT" title="Sign in to OpenShorts" size="md">
-      <p className="text-muted text-sm mb-6 lowercase">Access your plan and generate shorts with no API keys.</p>
+      <p className="text-muted text-sm mb-6 lowercase">
+        {isSaasAuth
+          ? 'Sign in to your workspace or create a new one.'
+          : 'Access your plan and generate shorts with no API keys.'}
+      </p>
+
+      {isSaasAuth && (
+        <div className="flex items-center gap-2 mb-5">
+          <button
+            type="button"
+            onClick={() => setMode('signin')}
+            className={`btn-quiet px-3 py-1.5 text-xs ${mode === 'signin' ? 'border border-rule2 text-ink' : ''}`}
+          >
+            Sign in
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode('signup')}
+            className={`btn-quiet px-3 py-1.5 text-xs ${mode === 'signup' ? 'border border-rule2 text-ink' : ''}`}
+          >
+            Create workspace
+          </button>
+        </div>
+      )}
 
       {sent ? (
         <div className="text-center py-6">
@@ -39,6 +94,31 @@ export default function LoginModal({ onClose }) {
       ) : (
         <>
           <form onSubmit={submit} className="space-y-3">
+            {isSaasAuth && mode === 'signup' && (
+              <>
+                <div className="relative">
+                  <Building2 size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
+                  <input
+                    type="text"
+                    value={workspaceName}
+                    onChange={(e) => setWorkspaceName(e.target.value)}
+                    placeholder="workspace name"
+                    className="input-field pl-10"
+                    autoFocus
+                  />
+                </div>
+                <div className="relative">
+                  <User size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
+                  <input
+                    type="text"
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    placeholder="your name"
+                    className="input-field pl-10"
+                  />
+                </div>
+              </>
+            )}
             <div className="relative">
               <Mail size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
               <input
@@ -50,17 +130,40 @@ export default function LoginModal({ onClose }) {
                 autoFocus
               />
             </div>
+            {isSaasAuth && (
+              <div className="relative">
+                <KeyRound size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="password"
+                  className="input-field pl-10"
+                />
+              </div>
+            )}
             {error && <p className="text-danger text-sm">{error}</p>}
             <button
               type="submit"
-              disabled={busy || !email.trim()}
+              disabled={
+                busy ||
+                !email.trim() ||
+                (isSaasAuth && !password.trim()) ||
+                (isSaasAuth && mode === 'signup' && (!workspaceName.trim() || !fullName.trim()))
+              }
               className="btn-primary w-full"
             >
-              {busy ? <Loader2 size={18} className="animate-spin" /> : 'Email me a sign-in link'}
+              {busy ? (
+                <Loader2 size={18} className="animate-spin" />
+              ) : isSaasAuth ? (
+                mode === 'signup' ? 'Create workspace' : 'Sign in with password'
+              ) : (
+                'Email me a sign-in link'
+              )}
             </button>
           </form>
 
-          {googleAuthEnabled && (
+          {!isSaasAuth && googleAuthEnabled && (
             <>
               <div className="flex items-center gap-3 my-5">
                 <div className="flex-1 border-t border-rule" />

@@ -22,6 +22,13 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+from saas.auth import decode_access_token
+from saas.config import load_saas_settings
+from saas.database import get_sessionmaker
+from saas.repositories import AssetRepository
+from saas.routes_auth import router as saas_auth_router
+from saas.routes_workflow import router as saas_workflow_router
+from saas.storage import build_source_storage_key, resolve_source_asset_path, sanitize_asset_filename
 
 load_dotenv()
 
@@ -69,6 +76,72 @@ else:
 async def _user_from_request(request: Request):
     """Load the authenticated cloud user (or None). Cheap indexed lookup."""
     return await get_current_user_optional(request)
+
+
+def _get_saas_auth_claims(request: Request) -> Optional[dict]:
+    if not load_saas_settings().enabled:
+        return None
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+
+    token = auth_header[7:].strip()
+    if not token:
+        return None
+
+    try:
+        payload = decode_access_token(token)
+        return {
+            "user_id": str(payload["sub"]),
+            "workspace_id": str(payload["workspace_id"]),
+        }
+    except Exception:
+        return None
+
+
+async def _persist_saas_source_asset(
+    *,
+    request: Request,
+    input_path: Optional[str],
+    source_name: str,
+    mime_type: Optional[str],
+) -> Optional[str]:
+    if not input_path or not os.path.exists(input_path):
+        return None
+
+    claims = _get_saas_auth_claims(request)
+    if claims is None:
+        return None
+
+    try:
+        workspace_id = uuid.UUID(claims["workspace_id"])
+    except ValueError:
+        return None
+
+    asset_id = uuid.uuid4()
+    storage_key = build_source_storage_key(
+        workspace_id=workspace_id,
+        asset_id=asset_id,
+        filename=source_name,
+    )
+    dest_path = resolve_source_asset_path(storage_key)
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    shutil.copy2(input_path, dest_path)
+
+    async with get_sessionmaker()() as session:
+        assets = AssetRepository(session)
+        await assets.create(
+            asset_id=asset_id,
+            workspace_id=workspace_id,
+            storage_key=storage_key,
+            mime_type=mime_type or "application/octet-stream",
+            size_bytes=os.path.getsize(dest_path),
+            kind="source-upload",
+        )
+        await session.commit()
+
+    return str(asset_id)
 
 
 async def resolve_gemini(request: Request) -> Optional[str]:
@@ -517,6 +590,9 @@ app = FastAPI(lifespan=lifespan)
 if BILLING_ENABLED:
     cloud.setup_sync(app)
 
+app.include_router(saas_auth_router)
+app.include_router(saas_workflow_router)
+
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
 # self-host keeps the permissive wildcard it has always used.
 app.add_middleware(
@@ -726,10 +802,14 @@ async def health():
 
 @app.get("/api/config")
 async def get_config():
+    saas_enabled = load_saas_settings().enabled
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
+        "saasEnabled": saas_enabled,
+        "geminiConfigured": bool(os.environ.get("GEMINI_API_KEY")),
+        "uploadPostConfigured": bool(os.environ.get("UPLOAD_POST_API_KEY")),
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -822,19 +902,21 @@ async def process_endpoint(
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
 
-    # Prepare Command
-    cmd = ["python", "-u", "main.py"] # -u for unbuffered
+    # Use the current interpreter so local venv runs do not depend on a global
+    # `python` executable being present on PATH.
+    cmd = [sys.executable, "-u", os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")]
     env = os.environ.copy()
     env["GEMINI_API_KEY"] = api_key # Override with key from request
 
     input_path = None
+    saas_source_asset_id = None
     if url:
         cmd.extend(["-u", url])
     else:
         # Save uploaded file with size limit check.
         # basename() strips any path components from the client-supplied
         # filename so a name like "../../main.py" can't escape UPLOAD_DIR.
-        safe_name = os.path.basename(file.filename or "upload") or "upload"
+        safe_name = sanitize_asset_filename(file.filename or "upload")
         input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{safe_name}")
 
         # Read file in chunks to check size
@@ -851,6 +933,16 @@ async def process_endpoint(
                 buffer.write(content)
 
         cmd.extend(["-i", input_path])
+
+        try:
+            saas_source_asset_id = await _persist_saas_source_asset(
+                request=request,
+                input_path=input_path,
+                source_name=safe_name,
+                mime_type=file.content_type,
+            )
+        except Exception as e:
+            print(f"⚠️ Could not persist SaaS source asset for {job_id}: {e}")
 
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
@@ -885,7 +977,7 @@ async def process_endpoint(
 
     _enqueue_job(job_id, priority)
 
-    return {"job_id": job_id, "status": "queued"}
+    return {"job_id": job_id, "status": "queued", "saas_source_asset_id": saas_source_asset_id}
 
 @app.get("/api/status/{job_id}")
 async def get_status(job_id: str, request: Request):

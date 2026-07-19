@@ -164,7 +164,7 @@ export default function PricingPage({ onRequireLogin }) {
                 <Check size={16} className="text-ok shrink-0" />
                 <span className="eyebrow">{card.eyebrow}</span>
               </div>
-              <p className="text-sm text-muted leading-relaxed">{card.body}</p>
+              <div className="text-sm text-muted leading-relaxed">{card.body}</div>
             </div>
           ))}
         </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Loader2, CreditCard, LogOut, Plus } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { apiJson } from '../lib/api';
@@ -7,13 +7,14 @@ const fmt1 = (n) => Math.round((n || 0) * 10) / 10;
 
 // Account/billing page: plan, usage meter, top-ups, manage billing, logout.
 export default function AccountPage() {
-  const { me, refreshMe, logout, plan, minutes } = useAuth();
+  const { billingEnabled, workspace, me, refreshMe, logout, plan, minutes } = useAuth();
   const [busy, setBusy] = useState(false);
   const [topups, setTopups] = useState([]);
   const [activating, setActivating] = useState(false);
 
   // After returning from Checkout the webhook may lag — poll /api/me briefly.
   useEffect(() => {
+    if (!billingEnabled) return;
     const hash = window.location.hash || '';
     if (!hash.includes('checkout=success')) return;
     setActivating(true);
@@ -37,11 +38,12 @@ export default function AccountPage() {
       }
     }, 2000);
     return () => clearInterval(t);
-  }, [refreshMe]);
+  }, [billingEnabled, refreshMe]);
 
   useEffect(() => {
+    if (!billingEnabled) return;
     apiJson('/api/billing/plans').then((d) => setTopups(d.topups || [])).catch(() => {});
-  }, []);
+  }, [billingEnabled]);
 
   const openPortal = useCallback(async () => {
     setBusy(true);
@@ -63,6 +65,36 @@ export default function AccountPage() {
   }, []);
 
   if (!me) return <div className="flex justify-center py-16"><Loader2 className="animate-spin text-brass" /></div>;
+
+  if (!billingEnabled) {
+    return (
+      <div className="max-w-2xl mx-auto space-y-6">
+        <div className="flex items-end justify-between gap-4">
+          <div>
+            <p className="eyebrow mb-1.5">ACCOUNT</p>
+            <h2 className="font-display lowercase text-2xl text-ink leading-tight">Your workspace</h2>
+            <p className="text-muted text-sm mt-1">{me.user?.email}</p>
+          </div>
+          <button onClick={logout} className="btn-quiet shrink-0">
+            <LogOut size={16} /> Sign out
+          </button>
+        </div>
+
+        <div className="card p-6 space-y-4">
+          <div>
+            <p className="eyebrow mb-1.5">WORKSPACE</p>
+            <p className="text-ink font-medium">{workspace?.name || 'Workspace'}</p>
+            {workspace?.slug && <p className="text-muted text-sm mt-1">slug: {workspace.slug}</p>}
+          </div>
+          <div className="pt-4 border-t border-rule">
+            <p className="eyebrow mb-1.5">PLAN</p>
+            <p className="text-ink font-medium capitalize">{workspace?.plan || 'free'}</p>
+            <p className="text-muted text-sm mt-1 lowercase">Billing and quota management will be connected in a later SaaS step.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const m = minutes || {};
   const total = (m.plan_allowance || 0) + (m.topup_remaining || 0) + (m.plan_used || 0);

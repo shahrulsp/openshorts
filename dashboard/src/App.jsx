@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
@@ -20,6 +20,13 @@ import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
+import {
+  completeSaasJob,
+  createSaasClipProjectJob,
+  failSaasJob,
+  retrySaasTrackedJob,
+  startSaasJob,
+} from './lib/saasWorkflow';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -170,7 +177,7 @@ const pollJob = async (jobId) => {
 
 function App() {
   // Cloud auth/billing session (inert when billing is disabled).
-  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe } = useAuth();
+  const { billingEnabled, saasEnabled, geminiConfigured, uploadPostConfigured, isManaged, isSignedIn, me, plan, refreshMe } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   const [showTrialUpgrade, setShowTrialUpgrade] = useState(false);
@@ -206,6 +213,7 @@ function App() {
   const [jobId, setJobId] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
+  const [saasTracking, setSaasTracking] = useState(null);
   // Bulk subtitles: apply one style to every clip of the job (triggered from
   // within a clip's subtitle modal via "apply to all").
   const [bulkSub, setBulkSub] = useState({ running: false, current: 0, total: 0, errors: 0 });
@@ -234,6 +242,8 @@ function App() {
   const [syncedTime, setSyncedTime] = useState(0);
   const [isSyncedPlaying, setIsSyncedPlaying] = useState(false);
   const [syncTrigger, setSyncTrigger] = useState(0);
+  const saasSyncState = useRef({ syncedLegacyStatus: null });
+  const saasTrackingEnabled = saasEnabled && !billingEnabled && isSignedIn;
 
   const handleClipPlay = (startTime) => {
     setSyncedTime(startTime);
@@ -243,6 +253,45 @@ function App() {
 
   const handleClipPause = () => {
     setIsSyncedPlaying(false);
+  };
+
+  const resetSaasTracking = (nextTracking = null) => {
+    setSaasTracking(nextTracking);
+    saasSyncState.current = { syncedLegacyStatus: nextTracking?.syncedLegacyStatus || null };
+  };
+
+  const syncSaasWorkflowStatus = async (legacyStatus, result, jobLogs) => {
+    if (!saasTrackingEnabled || !saasTracking?.jobId) return;
+
+    const syncedLegacyStatus = saasSyncState.current.syncedLegacyStatus || saasTracking.syncedLegacyStatus || null;
+    if (!legacyStatus || legacyStatus === syncedLegacyStatus) return;
+
+    try {
+      if (legacyStatus === 'processing') {
+        await startSaasJob(saasTracking.jobId);
+      } else if (legacyStatus === 'completed') {
+        if (syncedLegacyStatus !== 'processing') {
+          try {
+            await startSaasJob(saasTracking.jobId);
+          } catch (_) {
+            // Ignore stale refresh races; completion is the authoritative state.
+          }
+        }
+        await completeSaasJob(saasTracking.jobId, result, saasTracking.legacyJobId);
+      } else if (legacyStatus === 'failed') {
+        const failureLine = Array.isArray(jobLogs) && jobLogs.length > 0
+          ? jobLogs[jobLogs.length - 1]
+          : 'Clip generation failed';
+        await failSaasJob(saasTracking.jobId, failureLine);
+      } else {
+        return;
+      }
+
+      saasSyncState.current = { syncedLegacyStatus: legacyStatus };
+      setSaasTracking((current) => (current ? { ...current, syncedLegacyStatus: legacyStatus } : current));
+    } catch (e) {
+      console.warn('SaaS workflow sync failed', e);
+    }
   };
 
   // --- Project persistence (paid mode) ---
@@ -374,6 +423,7 @@ function App() {
       if (session.jobId && session.status && session.status !== 'idle') {
         setJobId(session.jobId);
         setResults(session.results || null);
+        resetSaasTracking(session.saasTracking || null);
         // Restore the source preview. Older sessions (or uploads) saved no
         // media, so fall back to the backend-served source for this job —
         // except for reopened projects, whose source was never persisted.
@@ -409,6 +459,7 @@ function App() {
         jobId,
         status,
         results,
+        saasTracking,
         processingMedia: persistMedia,
         activeTab,
         noSource,
@@ -420,7 +471,7 @@ function App() {
       // localStorage full or serialization error - ignore
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, status, results, activeTab, noSource, projectState]);
+  }, [jobId, status, results, saasTracking, activeTab, noSource, projectState]);
 
   useEffect(() => {
     // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
@@ -487,6 +538,8 @@ function App() {
             setResults(data.result);
           }
 
+          await syncSaasWorkflowStatus(data.status, data.result, data.logs);
+
           if (data.status === 'completed') {
             setStatus('complete');
             clearInterval(interval);
@@ -505,7 +558,7 @@ function App() {
       }, 2000);
     }
     return () => clearInterval(interval);
-  }, [status, jobId]);
+  }, [status, jobId, saasTracking]);
 
 
   // silent: background auto-fetch — never alert(), just log. Managed users need
@@ -534,9 +587,15 @@ function App() {
   };
 
   // Hosted is paid-only (no BYOK core). Self-host uses BYOK keys.
-  // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
-  const keysMissing = !billingEnabled && (!apiKey || !uploadPostKey);
+  // A local self-host can satisfy Gemini/Upload-Post either from browser BYOK
+  // inputs or from server-side environment variables exposed only as booleans.
+  const hasGeminiAccess = !!apiKey || (!billingEnabled && geminiConfigured);
+  const hasUploadPostAccess = !!uploadPostKey || (!billingEnabled && uploadPostConfigured);
+  const keysMissing = !billingEnabled && !hasGeminiAccess;
+  const publishingLimited = !billingEnabled && !hasUploadPostAccess;
+  const clipGeneratorMissingKey = !billingEnabled && !hasGeminiAccess;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
+  const accountEnabled = billingEnabled || saasEnabled;
   // Included in the plan (fully managed, no keys): Clip Generator + YouTube Studio.
   // Advanced (bring your own fal.ai + ElevenLabs keys): AI Shorts + AI Agent.
   const INCLUDED_TOOL_TABS = ['dashboard', 'thumbnails'];
@@ -567,18 +626,24 @@ function App() {
     }
   };
 
-  const handleProcess = async (data, forceLowQuality = false) => {
+  const handleProcess = async (data, processOptions = {}) => {
+    const normalizedOptions = typeof processOptions === 'boolean'
+      ? { forceLowQuality: processOptions }
+      : (processOptions || {});
+    const forceLowQuality = !!normalizedOptions.forceLowQuality;
+    const retryContext = normalizedOptions.retryContext || null;
     // Hosted: must be signed in AND on an active plan/trial. Self-host: BYOK keys.
     if (billingEnabled) {
       if (!isSignedIn) { setShowLogin(true); return; }
       if (!isManaged) { window.location.hash = '#/pricing'; return; }
-    } else if (keysMissing) {
+    } else if (clipGeneratorMissingKey) {
       setShowKeyModal(true);
       return;
     }
     setStatus('processing');
     setLogs(["Starting process..."]);
     setResults(null);
+    resetSaasTracking(null);
     setProcessingMedia(data);
     setQualityGate(null);
     setProjectState(null);
@@ -615,11 +680,29 @@ function App() {
       // 20 min on it. On confirm we resend with force_low_quality.
       if (resData.needs_confirmation) {
         setStatus('idle');
-        setQualityGate({ info: resData.quality_check, data });
+        setQualityGate({ info: resData.quality_check, data, retryContext });
         return;
       }
 
       setJobId(resData.job_id);
+
+      if (saasTrackingEnabled) {
+        try {
+          const sourceAssetId = resData.saas_source_asset_id || null;
+          const tracked = retryContext?.failedJobId
+            ? { job: await retrySaasTrackedJob(retryContext.failedJobId, resData.job_id, sourceAssetId), project: { id: retryContext.projectId } }
+            : await createSaasClipProjectJob(data, resData.job_id, sourceAssetId);
+          resetSaasTracking({
+            projectId: tracked.project.id,
+            jobId: tracked.job.id,
+            legacyJobId: resData.job_id,
+            syncedLegacyStatus: tracked.job.status || 'queued',
+          });
+        } catch (trackingError) {
+          console.warn('Could not create SaaS workflow record', trackingError);
+          setLogs((currentLogs) => [...currentLogs, 'Workspace tracking is unavailable for this run, but processing will continue.']);
+        }
+      }
 
     } catch (e) {
       if (e instanceof QuotaError) {
@@ -639,6 +722,54 @@ function App() {
     }
   };
 
+  const retrySaasJobFromHistory = async ({ projectId, job }) => {
+    if (!job || job.status !== 'failed') {
+      throw new Error('Only failed jobs can be retried.');
+    }
+
+    const payload = job.payload || {};
+    const baseData = {
+      acknowledged: payload.acknowledged !== false,
+      outputFormat: payload.output_format || 'auto',
+    };
+
+    let data;
+    if (payload.source_type === 'url' && payload.source_url) {
+      data = {
+        ...baseData,
+        type: 'url',
+        payload: payload.source_url,
+      };
+    } else if (payload.source_asset_id || payload.legacy_job_id) {
+      const sourceUrl = payload.source_asset_id
+        ? `/api/saas/assets/${payload.source_asset_id}/content`
+        : `/api/source/${payload.legacy_job_id}`;
+      const sourceResponse = await apiFetch(sourceUrl);
+      if (!sourceResponse.ok) {
+        throw new Error('The original uploaded source is no longer available for retry. Re-upload the file to start a fresh run.');
+      }
+
+      const blob = await sourceResponse.blob();
+      const fileName = payload.source_name || 'retry-source.mp4';
+      const fileType = blob.type || 'video/mp4';
+      data = {
+        ...baseData,
+        type: 'file',
+        payload: new File([blob], fileName, { type: fileType }),
+      };
+    } else {
+      throw new Error('This job does not have enough saved source data to retry yet.');
+    }
+
+    setActiveTab('dashboard');
+    await handleProcess(data, {
+      retryContext: {
+        projectId,
+        failedJobId: job.id,
+      },
+    });
+  };
+
   const handleReset = () => {
     // Flush any pending edit-state sync before dropping the project: the clips
     // themselves are already archived to R2 as they were edited.
@@ -646,6 +777,7 @@ function App() {
     setStatus('idle');
     setJobId(null);
     setResults(null);
+    resetSaasTracking(null);
     setLogs([]);
     setProcessingMedia(null);
     setProjectState(null);
@@ -656,14 +788,16 @@ function App() {
   // --- UI Components ---
 
   const Sidebar = () => {
+    const showHistory = isSignedIn && (billingEnabled || saasEnabled);
+    const settingsOrd = showHistory ? '07' : '06';
     const navItems = [
       { id: 'dashboard', ord: '01', icon: LayoutDashboard, label: 'Clip Generator' },
       { id: 'saasshorts', ord: '02', icon: Sparkles, label: 'AI Shorts', byok: true },
       { id: 'ai-agent', ord: '03', icon: Bot, label: 'AI Agent', byok: true },
       { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery' },
       { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio' },
-      ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '06', icon: History, label: 'History' }] : []),
-      { id: 'settings', ord: '07', icon: Settings, label: 'Settings' },
+      ...(showHistory ? [{ id: 'history', ord: '06', icon: History, label: 'History' }] : []),
+      { id: 'settings', ord: settingsOrd, icon: Settings, label: 'Settings' },
     ];
 
     return (
@@ -773,15 +907,15 @@ function App() {
                 Start free trial
               </button>
             )}
-            {billingEnabled && !isSignedIn && (
+            {accountEnabled && !isSignedIn && (
               <button onClick={() => setShowLogin(true)}
                 className="btn-ghost px-4 py-2 text-xs">
                 Sign in
               </button>
             )}
-            {billingEnabled && isSignedIn && <ProfileMenu />}
+            {accountEnabled && isSignedIn && <ProfileMenu />}
 
-            {keysMissing && (
+            {(keysMissing || publishingLimited) && (
               <button
                 onClick={() => (billingEnabled && !isSignedIn ? setShowLogin(true) : setActiveTab('settings'))}
                 className="badge-warn hover:brightness-125 transition-all"
@@ -789,11 +923,11 @@ function App() {
               >
                 <AlertTriangle size={12} />
                 <span className="hidden sm:inline">
-                  {!apiKey && !uploadPostKey
-                    ? 'Gemini & Upload-Post keys missing'
-                    : !apiKey
+                  {keysMissing && publishingLimited
+                    ? 'Gemini required, Upload-Post optional'
+                    : keysMissing
                       ? 'Gemini API Key Missing'
-                      : 'Upload-Post API Key Missing'}
+                      : 'Upload-Post missing for publishing'}
                 </span>
                 <span className="sm:hidden">keys missing</span>
               </button>
@@ -802,18 +936,20 @@ function App() {
         </header>
 
         {/* Persistent Missing Keys Banner — visible on every screen */}
-        {keysMissing && activeTab !== 'settings' && (
+        {(keysMissing || publishingLimited) && activeTab !== 'settings' && (
           <div className="mx-4 sm:mx-6 mt-3 px-4 py-3 bg-paper2 border border-rule rounded-card flex flex-wrap items-center justify-between gap-3 sm:gap-4 shrink-0 animate-fade">
             <div className="flex items-center gap-3 text-sm text-ink2">
               <KeyRound size={16} className="shrink-0 text-warn" />
               <div>
-                <span className="font-medium text-ink">Required API keys missing.</span>{' '}
+                <span className="font-medium text-ink">
+                  {keysMissing ? 'Required API key missing.' : 'Publishing key not configured.'}
+                </span>{' '}
                 <span className="text-muted">
-                  {!apiKey && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
-                    : !apiKey
+                  {keysMissing && publishingLimited
+                    ? 'Set Gemini to generate clips. Add Upload-Post later if you want direct publishing.'
+                    : keysMissing
                       ? 'Set your Gemini API key to use OpenShorts.'
-                      : 'Set your Upload-Post API key to use OpenShorts.'}
+                      : 'Clip generation still works. Add Upload-Post later if you want direct publishing.'}
                 </span>
               </div>
             </div>
@@ -848,13 +984,12 @@ function App() {
 
         {/* Main Workspace */}
         <div className="flex-1 overflow-hidden relative">
-
           {/* View: Settings */}
           {activeTab === 'settings' && (
             <div className="h-full overflow-y-auto p-4 sm:p-8 max-w-2xl mx-auto animate-fade">
               <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 mb-8">
                 <div>
-                  <p className="eyebrow mb-1.5">07 · SETTINGS</p>
+                  <p className="eyebrow mb-1.5">{billingEnabled && isSignedIn ? '07' : '06'} · SETTINGS</p>
                   <h1 className="font-display lowercase text-2xl text-ink">Settings</h1>
                 </div>
                 <div className="flex items-center gap-2 text-xs text-muted mt-1">
@@ -1214,7 +1349,7 @@ function App() {
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-6 md:p-8">
-                <HistoryTab onReopenProject={restoreProject} />
+                <HistoryTab onReopenProject={restoreProject} onRetrySaasJob={retrySaasJobFromHistory} />
               </div>
             </div>
           )}
@@ -1402,9 +1537,9 @@ function App() {
         isOpen={showKeyModal}
         onClose={() => setShowKeyModal(false)}
         eyebrow="SETUP"
-        title={!apiKey && !uploadPostKey
+        title={!hasGeminiAccess && !hasUploadPostAccess
           ? 'Required API Keys Missing'
-          : !apiKey
+          : !hasGeminiAccess
             ? 'Gemini API Key Required'
             : 'Upload-Post API Key Required'}
         footer={
@@ -1426,16 +1561,16 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            OpenShorts needs <strong className="text-ink2">Gemini</strong> for clip generation and <strong className="text-ink2">Upload-Post</strong> for direct publishing. In self-host mode, either can come from your browser settings or the server environment.
           </p>
 
           {/* Gemini block */}
-          <div className={`rounded-input p-4 space-y-2 border ${!apiKey ? 'border-rule2' : 'border-rule opacity-70'}`}>
+          <div className={`rounded-input p-4 space-y-2 border ${!hasGeminiAccess ? 'border-rule2' : 'border-rule opacity-70'}`}>
             <p className="text-xs font-medium text-ink flex items-center gap-2">
-              {apiKey ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
-              Gemini API Key {apiKey && <span className="text-ok">— set</span>}
+              {hasGeminiAccess ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
+              Gemini API Key {hasGeminiAccess && <span className="text-ok">— set</span>}
             </p>
-            {!apiKey && (
+            {!hasGeminiAccess && (
               <>
                 <ol className="text-xs text-muted space-y-1 list-decimal list-inside">
                   <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-brass underline">aistudio.google.com/app/apikey</a></li>
@@ -1458,12 +1593,12 @@ function App() {
           </div>
 
           {/* Upload-Post block */}
-          <div className={`rounded-input p-4 space-y-2 border ${!uploadPostKey ? 'border-rule2' : 'border-rule opacity-70'}`}>
+          <div className={`rounded-input p-4 space-y-2 border ${!hasUploadPostAccess ? 'border-rule2' : 'border-rule opacity-70'}`}>
             <p className="text-xs font-medium text-ink flex items-center gap-2">
-              {uploadPostKey ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
-              Upload-Post API Key {uploadPostKey && <span className="text-ok">— set</span>}
+              {hasUploadPostAccess ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
+              Upload-Post API Key {hasUploadPostAccess && <span className="text-ok">— set</span>}
             </p>
-            {!uploadPostKey && (
+            {!hasUploadPostAccess && (
               <>
                 <p className="text-xs text-muted">
                   Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Free tier available, no credit card needed.
@@ -1516,7 +1651,12 @@ function App() {
             <div className="flex gap-2 justify-end pt-2">
               <button onClick={() => setQualityGate(null)} className="btn-ghost">cancel</button>
               <button
-                onClick={() => { const d = qualityGate.data; setQualityGate(null); handleProcess(d, true); }}
+                onClick={() => {
+                  const d = qualityGate.data;
+                  const retryContext = qualityGate.retryContext || null;
+                  setQualityGate(null);
+                  handleProcess(d, { forceLowQuality: true, retryContext });
+                }}
                 className="btn-primary"
               >
                 process anyway
